@@ -1,9 +1,10 @@
 import cv2
 import numpy as np
-from collections import Counter
 from PIL import Image, ImageFont, ImageDraw
+
 from face_detector import FaceDetector
 from feature_extractor import FeatureExtractor
+from expression_analyzer import ExpressionAnalyzer
 from rule_engine import RuleEngine
 
 
@@ -27,19 +28,22 @@ def main():
         print("Error: Could not access the webcam!")
         return
 
+    print("Webcam connected. Starting complete Vector Space Model loop...")
+
     detector = FaceDetector()
     extractor = FeatureExtractor()
+    analyzer = ExpressionAnalyzer()
     engine = RuleEngine()
 
     frame_count = 0
-    cached_text = "😐 99%"
+    cached_text = "😐 100%"
     cached_raw_data = None
-    emoji_history = []
-    history_size = 5
-    emoji_position = (50, 50)
 
-    # متغیرهای جدید برای کالیبراسیون
-    calibration_frames = 60  # کالیبراسیون در 60 فریم اول (حدود 2 تا 3 ثانیه)
+    # دیکشنری برای نرم کردن (Smoothing) درصد ایموجی‌ها
+    smoothed_probs = {}
+
+    # فاز کالیبراسیون هوشمند 3 ثانیه‌ای (60 فریم)
+    calibration_frames = 60
     calibration_data = []
     is_calibrated = False
 
@@ -52,53 +56,64 @@ def main():
         h, w, _ = frame.shape
         frame_count += 1
 
-        # پردازش فریم‌ها یک فریم در میان برای بهینه‌سازی سرعت
         if frame_count % 2 == 1:
             landmarks, raw_face_data = detector.get_landmarks(frame)
             cached_raw_data = raw_face_data
 
             if landmarks:
-                # محاسبه موقعیت داینامیک بالای سر
-                forehead_x = int(landmarks[10][0] * w)
-                forehead_y = int(landmarks[10][1] * h)
-                emoji_position = (forehead_x - 50, forehead_y - 80)
+                # مرحله 1: استخراج ویژگی‌های هندسی توسعه‌یافته
+                raw_features = extractor.extract_features(landmarks)
 
-                features = extractor.extract_features(landmarks)
-                if features:
-                    # فاز کالیبراسیون
+                if raw_features:
+                    # فاز اسکن و کالیبراسیون چهره خنثی کاربر
                     if not is_calibrated and len(calibration_data) < calibration_frames:
-                        calibration_data.append(features)
-                        cached_text = "Calibrating... Keep Neutral Face"
+                        calibration_data.append(raw_features)
+                        cached_text = "Calibrating...\nKeep Neutral Face"
 
-                        # اگر به فریم ۶۰ رسیدیم، میانگین بگیر و به موتور قوانین بده
                         if len(calibration_data) == calibration_frames:
                             avg_baselines = {}
-                            for key in features.keys():
+                            for key in raw_features.keys():
                                 avg_baselines[key] = np.mean([f[key] for f in calibration_data])
 
-                            engine.update_baselines(avg_baselines)
+                            # کالیبره کردن لایه تحلیل‌گر بر اساس چهره اختصاصی شما
+                            analyzer.update_baselines(avg_baselines)
                             is_calibrated = True
 
-                    # فاز اجرای عادی (بعد از کالیبراسیون)
+                    # فاز اجرای عادی پس از اتمام کالیبراسیون
                     elif is_calibrated:
-                        emoji_probs = engine.get_probabilities(features)
-                        best_emoji, best_prob = emoji_probs[0]
+                        # مرحله 2: تبدیل ویژگی‌های خام به شاخص‌های حسی کالیبره‌شده
+                        emotion_indices = analyzer.analyze(raw_features)
 
-                        emoji_history.append(best_emoji)
-                        if len(emoji_history) > history_size:
-                            emoji_history.pop(0)
+                        # مرحله 3: اجرای مدل ضرب برداری و گرفتن درصد احتمالات (تمامی ایموجی‌ها)
+                        emoji_probs = engine.get_probabilities(emotion_indices)
 
-                        stable_emoji = Counter(emoji_history).most_common(1)[0][0]
-                        cached_text = f"{stable_emoji} {best_prob}%"
+                        current_probs_dict = dict(emoji_probs)
 
-        # رسم اجزا
+                        # اعمال میانگین متحرک نمایی (EMA) برای نرم شدن تغییرات درصدها
+                        if not smoothed_probs:
+                            smoothed_probs = current_probs_dict
+                        else:
+                            for k in current_probs_dict:
+                                smoothed_probs[k] = int(0.6 * smoothed_probs.get(k, 0) + 0.4 * current_probs_dict[k])
+
+                        # مرتب‌سازی مجدد بعد از نرم‌سازی
+                        sorted_smoothed = sorted(smoothed_probs.items(), key=lambda item: item[1], reverse=True)
+
+                        # استخراج 5 ایموجی برتر
+                        top_5 = sorted_smoothed[:5]
+
+                        # ساخت متن چندخطی برای نمایش در تصویر
+                        cached_text = "Top 5 Predictions:\n"
+                        for idx, (emoji, prob) in enumerate(top_5):
+                            cached_text += f"{idx + 1}. {emoji} {prob}%\n"
+
         if cached_raw_data:
             frame = detector.draw_landmarks(frame, cached_raw_data)
 
-        # تغییر رنگ متن در زمان کالیبراسیون به زرد برای جذابیت بصری
+        # مدیریت رنگ، موقعیت و فونت متن (پنل ثابت در گوشه تصویر)
         text_color = (0, 255, 255) if not is_calibrated else (255, 255, 255)
-        text_pos = (50, 50) if not is_calibrated else emoji_position
-        size = 35 if not is_calibrated else 55
+        text_pos = (30, 30)  # قفل کردن موقعیت در گوشه سمت چپ بالا برای جلوگیری از پرش متن
+        size = 35 if not is_calibrated else 40
 
         frame = draw_text_with_pil(frame, cached_text, text_pos, font_size=size, color=text_color)
 
